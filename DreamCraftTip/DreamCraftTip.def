@@ -1,0 +1,12 @@
+; ============================================================================
+; DreamCraftTip.def — DLL 导出表
+; Notepad++ 插件契约要求导出 6 个函数（PluginInterface.h:65-72）
+; ============================================================================
+LIBRARY DreamCraftTip
+EXPORTS
+    setInfo
+    getName
+    getFuncsArray
+    beNotified
+    messageProc
+    isUnicode

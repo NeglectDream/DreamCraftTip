@@ -1,0 +1,43 @@
+# ============================================================================
+# .gitignore — DreamCraftTip (Notepad++ 插件)
+# ============================================================================
+
+# ---- 构建产物 ----
+build/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+
+# ---- 发布包（由 CI 或手动打包生成，不入库）----
+dist/
+*.zip
+
+# ---- 物品图标资源（体积大，单独分发；用户可从 Minecraft 客户端提取）----
+icons/
+
+# ---- Notepad++ SDK（项目内 sdk/ 已含必要头文件，根副本忽略）----
+npp_sdk/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.vs/
+*.user
+*.suo
+*.sln.docstates
+
+# ---- 调试 / 诊断输出 ----
+*.log
+dbg*.txt
+cmp.txt
+
+# ---- NarraFork 会话目录 ----
+.narrafork/
+
+# ---- 操作系统 ----
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
