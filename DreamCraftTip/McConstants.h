@@ -36,6 +36,8 @@
 #define STYLE_MC_ICON_SLOT_COUNT 9
 #define STYLE_MC_BOLD_BASE       240
 #define STYLE_MC_BOLD_COUNT      9
+// Scintilla YAML lexer 的块标量正文 style（SCE_YAML_TEXT）。
+#define STYLE_YAML_BLOCK_TEXT    7
 
 // ---- 行内图标 ----
 // 旧版本曾占用 margin 4；新版本仅把其宽度归零，不再注册 marker。
@@ -45,7 +47,9 @@
 
 // ---- 节流与扫描上限 ----
 // SCN_MODIFIED 每次按键触发，用 SetTimer 合并此窗口内的多次为一次
-#define MC_DEBOUNCE_MS     300
+#define MC_DEBOUNCE_MS           300
+// 文件打开/切换会连续产生多个 NPP 通知，用短窗口合并为一次扫描。
+#define MC_FILE_EVENT_DEBOUNCE_MS 25
 // 超过此字节数的文件只扫描可见区域 ± 该范围，避免大文件卡顿
 #define MC_MAX_SCAN_BYTES        524288  // 512 KB
 #define MC_VISIBLE_PADDING_CHARS 5000    // 大文件可见区上下文缓冲

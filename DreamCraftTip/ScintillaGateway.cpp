@@ -6,21 +6,40 @@
 // ============================================================================
 #include "ScintillaGateway.h"
 
-ScintillaGateway::ScintillaGateway(HWND scintilla) noexcept
-    : scintilla_(scintilla) {
+ScintillaGateway::ScintillaGateway(HWND scintilla) noexcept {
+    attach(scintilla);
 }
 
 void ScintillaGateway::attach(HWND scintilla) noexcept {
+    if (scintilla_ == scintilla && directFunction_ && directPointer_)
+        return;
+
     scintilla_ = scintilla;
+    directFunction_ = nullptr;
+    directPointer_ = 0;
+    if (!scintilla_) return;
+
+    directFunction_ = reinterpret_cast<SciFnDirect>(
+        ::SendMessage(scintilla_, SCI_GETDIRECTFUNCTION, 0, 0));
+    directPointer_ = static_cast<sptr_t>(
+        ::SendMessage(scintilla_, SCI_GETDIRECTPOINTER, 0, 0));
 }
 
 LRESULT ScintillaGateway::send(UINT msg, WPARAM wParam, LPARAM lParam) const noexcept {
+    if (directFunction_ && directPointer_) {
+        return static_cast<LRESULT>(directFunction_(
+            directPointer_, msg, static_cast<uptr_t>(wParam), static_cast<sptr_t>(lParam)));
+    }
     return ::SendMessage(scintilla_, msg, wParam, lParam);
 }
 
 // ---- 文本与位置信息 ----
 Sci_Position ScintillaGateway::getLength() const noexcept {
     return static_cast<Sci_Position>(send(SCI_GETLENGTH));
+}
+
+sptr_t ScintillaGateway::getDocumentPointer() const noexcept {
+    return static_cast<sptr_t>(send(SCI_GETDOCPOINTER));
 }
 
 int ScintillaGateway::getLineCount() const noexcept {
@@ -86,6 +105,25 @@ std::string ScintillaGateway::getTextRange(Sci_Position start, Sci_Position end)
 // ---- 字符 Style ----
 int ScintillaGateway::getStyleIndexAt(Sci_Position pos) const noexcept {
     return static_cast<int>(send(SCI_GETSTYLEINDEXAT, static_cast<WPARAM>(pos)));
+}
+
+std::vector<unsigned char> ScintillaGateway::getStyleIndices(
+    Sci_Position start, Sci_Position end) const {
+    if (start < 0) start = 0;
+    if (end <= start) return {};
+
+    const size_t length = static_cast<size_t>(end - start);
+    std::vector<char> styled(length * 2 + 2, '\0');
+    Sci_TextRangeFull range{};
+    range.chrg.cpMin = start;
+    range.chrg.cpMax = end;
+    range.lpstrText = styled.data();
+    send(SCI_GETSTYLEDTEXTFULL, 0, reinterpret_cast<LPARAM>(&range));
+
+    std::vector<unsigned char> styles(length);
+    for (size_t i = 0; i < length; ++i)
+        styles[i] = static_cast<unsigned char>(styled[i * 2 + 1]);
+    return styles;
 }
 
 void ScintillaGateway::colourise(Sci_Position start, Sci_Position end) const noexcept {

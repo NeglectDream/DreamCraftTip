@@ -7,6 +7,7 @@
 // ============================================================================
 #include "McColorLexer.h"
 #include <cctype>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -42,13 +43,25 @@ COLORREF parseHex6(const char* s) {
     return RGB(vals[0] * 16 + vals[1], vals[2] * 16 + vals[3], vals[4] * 16 + vals[5]);
 }
 
-// MiniMessage 命名颜色表
-COLORREF namedColor(const std::string& name) {
+char lowerChar(char c) noexcept {
+    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+}
+
+bool equalsIgnoreCase(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (size_t i = 0; i < left.size(); ++i) {
+        if (lowerChar(left[i]) != lowerChar(right[i])) return false;
+    }
+    return true;
+}
+
+// MiniMessage 命名颜色表。使用 string_view 避免为标签名分配字符串。
+COLORREF namedColor(std::string_view name) {
     struct NamedColor {
-        const char* name = nullptr;
+        std::string_view name;
         COLORREF color = CLR_INVALID;
     };
-    static const NamedColor kTable[] = {
+    static constexpr NamedColor kTable[] = {
         {"black",RGB(0,0,0)},         {"dark_blue",RGB(0,0,170)},
         {"dark_green",RGB(0,170,0)},  {"dark_aqua",RGB(0,170,170)},
         {"dark_red",RGB(170,0,0)},    {"dark_purple",RGB(170,0,170)},
@@ -59,17 +72,18 @@ COLORREF namedColor(const std::string& name) {
         {"yellow",RGB(255,255,85)},   {"white",RGB(255,255,255)},
     };
     for (const auto& entry : kTable)
-        if (name == entry.name) return entry.color;
-    if (name == "grey") return RGB(170,170,170);
-    if (name == "dark_grey") return RGB(85,85,85);
+        if (equalsIgnoreCase(name, entry.name)) return entry.color;
+    if (equalsIgnoreCase(name, "grey")) return RGB(170,170,170);
+    if (equalsIgnoreCase(name, "dark_grey")) return RGB(85,85,85);
     return CLR_INVALID;
 }
 
-COLORREF parseColorArgument(std::string argument) {
+COLORREF parseColorArgument(std::string_view argument) {
     if (argument.size() >= 2 &&
         ((argument.front() == '\'' && argument.back() == '\'') ||
          (argument.front() == '"' && argument.back() == '"'))) {
-        argument = argument.substr(1, argument.size() - 2);
+        argument.remove_prefix(1);
+        argument.remove_suffix(1);
     }
     if (argument.size() == 7 && argument[0] == '#')
         return parseHex6(argument.data() + 1);
@@ -86,7 +100,7 @@ struct CodeParse {
     bool        colorChanged = false;
     bool        clearDecorations = false;
     COLORREF    color = CLR_INVALID;
-    std::string tagName;
+    std::string_view tagName;
     int         bold = 0, italic = 0, underline = 0, strike = 0;
     StackAction colorStack = StackAction::None;
     StackAction boldStack = StackAction::None;
@@ -154,33 +168,38 @@ CodeParse parseAmpCode(const std::string& v, size_t i) {
     return r;
 }
 
-// 解析 MiniMessage <...> 标签
+// 解析 MiniMessage <...> 标签。遇到下一个 '<' 时立即判定当前标签未闭合，
+// 使连续或大量未闭合 '<' 的总扫描量保持线性。
 CodeParse parseTag(const std::string& v, size_t i) {
     CodeParse r;
     if (v[i] != '<') return r;
-    const size_t close = v.find('>', i + 1);
-    if (close == std::string::npos) return r;
+    const size_t close = v.find_first_of("<>", i + 1);
+    if (close == std::string::npos || v[close] != '>') return r;
 
-    std::string tag = v.substr(i + 1, close - i - 1);
+    std::string_view tag(v.data() + i + 1, close - i - 1);
     bool closing = false;
-    if (!tag.empty() && tag[0] == '/') { closing = true; tag.erase(0, 1); }
+    if (!tag.empty() && tag.front() == '/') {
+        closing = true;
+        tag.remove_prefix(1);
+    }
     if (tag.empty()) return r;
-    for (char& c : tag)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
     r.matched = true;
     r.end = close + 1;
 
     const size_t argumentSeparator = tag.find(':');
-    const std::string verboseName = argumentSeparator == std::string::npos
+    const std::string_view verboseName = argumentSeparator == std::string_view::npos
         ? tag : tag.substr(0, argumentSeparator);
-    if (verboseName == "color" || verboseName == "colour" || verboseName == "c") {
+    if (equalsIgnoreCase(verboseName, "color") ||
+        equalsIgnoreCase(verboseName, "colour") ||
+        equalsIgnoreCase(verboseName, "c")) {
         r.tagName = "color";
         if (closing) {
             r.colorStack = StackAction::Pop;
             return r;
         }
-        if (argumentSeparator == std::string::npos || argumentSeparator + 1 >= tag.size()) {
+        if (argumentSeparator == std::string_view::npos ||
+            argumentSeparator + 1 >= tag.size()) {
             r.matched = false;
             return r;
         }
@@ -194,7 +213,7 @@ CodeParse parseTag(const std::string& v, size_t i) {
         return r;
     }
 
-    if (tag[0] == '#') {
+    if (tag.front() == '#') {
         if (tag.size() == 7) {
             const COLORREF hex = parseHex6(tag.data() + 1);
             if (hex != CLR_INVALID) {
@@ -207,27 +226,27 @@ CodeParse parseTag(const std::string& v, size_t i) {
         r.matched = false;
         return r;
     }
-    if (tag == "bold" || tag == "b") {
+    if (equalsIgnoreCase(tag, "bold") || equalsIgnoreCase(tag, "b")) {
         r.boldStack = closing ? StackAction::Pop : StackAction::Push;
         r.tagName = "bold";
         return r;
     }
-    if (tag == "italic" || tag == "i") {
+    if (equalsIgnoreCase(tag, "italic") || equalsIgnoreCase(tag, "i")) {
         r.italicStack = closing ? StackAction::Pop : StackAction::Push;
         r.tagName = "italic";
         return r;
     }
-    if (tag == "underlined" || tag == "u") {
+    if (equalsIgnoreCase(tag, "underlined") || equalsIgnoreCase(tag, "u")) {
         r.underlineStack = closing ? StackAction::Pop : StackAction::Push;
         r.tagName = "underlined";
         return r;
     }
-    if (tag == "strikethrough" || tag == "st") {
+    if (equalsIgnoreCase(tag, "strikethrough") || equalsIgnoreCase(tag, "st")) {
         r.strikeStack = closing ? StackAction::Pop : StackAction::Push;
         r.tagName = "strikethrough";
         return r;
     }
-    if (tag == "reset" && !closing) {
+    if (equalsIgnoreCase(tag, "reset") && !closing) {
         r.reset = true;
         return r;
     }
@@ -252,9 +271,10 @@ std::vector<ColorSegment> McColorLexer::lex(const std::string& value) const {
 
     COLORREF curColor = CLR_INVALID;
     bool bold = false, italic = false, underline = false, strike = false;
-    std::vector<std::pair<std::string, COLORREF>> colorStack;
-    std::vector<std::pair<std::string, bool>> boldStack, italicStack,
-                                              underlineStack, strikeStack;
+    // 标签名视图均引用本次 lex 的只读 value，栈生命周期不会越过该调用。
+    std::vector<std::pair<std::string_view, COLORREF>> colorStack;
+    std::vector<std::pair<std::string_view, bool>> boldStack, italicStack,
+                                                   underlineStack, strikeStack;
 
     // 把 [from, to) 用当前状态成段
     auto emit = [&](size_t from, size_t to) {
@@ -267,15 +287,15 @@ std::vector<ColorSegment> McColorLexer::lex(const std::string& value) const {
         segs.push_back(s);
     };
 
-    auto hasMatchingTop = [](StackAction action, const std::string& tag,
+    auto hasMatchingTop = [](StackAction action, std::string_view tag,
                              const auto& stack) {
         return action != StackAction::Pop ||
-               (!stack.empty() && stack.back().first == tag);
+               (!stack.empty() && equalsIgnoreCase(stack.back().first, tag));
     };
 
-    auto applyBoolState = [](StackAction action, int direct, const std::string& tag,
+    auto applyBoolState = [](StackAction action, int direct, std::string_view tag,
                              bool& state,
-                             std::vector<std::pair<std::string, bool>>& stack) {
+                             std::vector<std::pair<std::string_view, bool>>& stack) {
         if (action == StackAction::Push) {
             stack.emplace_back(tag, state);
             state = true;

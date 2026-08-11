@@ -51,16 +51,20 @@ void ColorIndicator::init() {
     }
 }
 
-void ColorIndicator::clearAll(Sci_Position docLen) {
-    // 隐藏 indicator 会随文本编辑自动移动，因此可用于准确恢复旧粗体区间。
-    restoreBoldStyles(docLen);
-    gateway_.colourise(0, docLen);
+void ColorIndicator::clearRange(Sci_Position start, Sci_Position end, bool recolourise) {
+    if (end <= start) return;
 
+    // 隐藏 indicator 会随文本编辑自动移动，因此可用于准确恢复旧粗体区间。
+    restoreBoldStyles(start, end);
+    if (recolourise)
+        gateway_.colourise(start, end);
+
+    const Sci_Position length = end - start;
     const int indicators[] = {INDIC_MC_COLOR, INDIC_MC_BOLD, INDIC_MC_ITALIC,
                               INDIC_MC_UNDERLINE, INDIC_MC_STRIKE};
     for (int indicator : indicators) {
         gateway_.setIndicatorCurrent(indicator);
-        gateway_.indicatorClearRange(0, docLen);
+        gateway_.indicatorClearRange(start, length);
     }
 }
 
@@ -96,22 +100,24 @@ void ColorIndicator::paint(const ColorSegment& seg, Sci_Position valueStart) {
 
 bool ColorIndicator::applyBoldStyle(Sci_Position start, Sci_Position len) {
     const Sci_Position end = start + len;
-    Sci_Position pos = start;
+    const std::vector<unsigned char> styles = gateway_.getStyleIndices(start, end);
     bool applied = false;
 
-    while (pos < end) {
-        const int rawStyle = gateway_.getStyleIndexAt(pos);
-        Sci_Position runEnd = pos + 1;
-        while (runEnd < end && gateway_.getStyleIndexAt(runEnd) == rawStyle)
+    size_t offset = 0;
+    while (offset < styles.size()) {
+        const int rawStyle = styles[offset];
+        size_t runEnd = offset + 1;
+        while (runEnd < styles.size() && styles[runEnd] == rawStyle)
             ++runEnd;
 
         const int baseStyle = baseStyleOf(rawStyle);
         if (isSupportedBaseStyle(baseStyle)) {
-            gateway_.startStyling(pos);
-            gateway_.setStyling(runEnd - pos, STYLE_MC_BOLD_BASE + baseStyle);
+            gateway_.startStyling(start + static_cast<Sci_Position>(offset));
+            gateway_.setStyling(static_cast<Sci_Position>(runEnd - offset),
+                                STYLE_MC_BOLD_BASE + baseStyle);
             applied = true;
         }
-        pos = runEnd;
+        offset = runEnd;
     }
 
     if (applied) {
@@ -122,27 +128,30 @@ bool ColorIndicator::applyBoldStyle(Sci_Position start, Sci_Position len) {
     return applied;
 }
 
-void ColorIndicator::restoreBoldStyles(Sci_Position docLen) {
-    Sci_Position pos = 0;
-    while (pos < docLen) {
+void ColorIndicator::restoreBoldStyles(Sci_Position start, Sci_Position end) {
+    Sci_Position pos = start;
+    while (pos < end) {
         const int indicatorValue = gateway_.indicatorValueAt(INDIC_MC_BOLD, pos);
         Sci_Position rangeEnd = gateway_.indicatorEnd(INDIC_MC_BOLD, pos);
         if (rangeEnd <= pos) rangeEnd = pos + 1; // 防御异常返回，保证循环前进。
-        if (rangeEnd > docLen) rangeEnd = docLen;
+        if (rangeEnd > end) rangeEnd = end;
 
         if (indicatorValue != 0) {
-            Sci_Position stylePos = pos;
-            while (stylePos < rangeEnd) {
-                const int rawStyle = gateway_.getStyleIndexAt(stylePos);
-                Sci_Position styleEnd = stylePos + 1;
-                while (styleEnd < rangeEnd && gateway_.getStyleIndexAt(styleEnd) == rawStyle)
-                    ++styleEnd;
+            const std::vector<unsigned char> styles =
+                gateway_.getStyleIndices(pos, rangeEnd);
+            size_t offset = 0;
+            while (offset < styles.size()) {
+                const int rawStyle = styles[offset];
+                size_t runEnd = offset + 1;
+                while (runEnd < styles.size() && styles[runEnd] == rawStyle)
+                    ++runEnd;
 
                 if (isPluginBoldStyle(rawStyle)) {
-                    gateway_.startStyling(stylePos);
-                    gateway_.setStyling(styleEnd - stylePos, baseStyleOf(rawStyle));
+                    gateway_.startStyling(pos + static_cast<Sci_Position>(offset));
+                    gateway_.setStyling(static_cast<Sci_Position>(runEnd - offset),
+                                        baseStyleOf(rawStyle));
                 }
-                stylePos = styleEnd;
+                offset = runEnd;
             }
         }
         pos = rangeEnd;

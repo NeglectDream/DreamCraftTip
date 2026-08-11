@@ -60,30 +60,13 @@ std::string asciiLower(std::string s) {
     return s;
 }
 
-// 加载 PNG 并缩放到 MC_ICON_SIZE，缓存 GDI+ 可直接绘制的 BGRA 像素。
-bool loadIconBgra(const std::wstring& path, IconImage& out) {
-    Gdiplus::Bitmap src(path.c_str());
-    if (src.GetLastStatus() != Gdiplus::Ok)
-        return false;
-
-    Gdiplus::Bitmap bmp(MC_ICON_SIZE, MC_ICON_SIZE, PixelFormat32bppARGB);
-    if (bmp.GetLastStatus() != Gdiplus::Ok)
-        return false;
-
-    {
-        Gdiplus::Graphics g(&bmp);
-        if (g.GetLastStatus() != Gdiplus::Ok)
-            return false;
-        g.Clear(Gdiplus::Color(0, 0, 0, 0));
-        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-        if (g.DrawImage(&src, 0, 0, MC_ICON_SIZE, MC_ICON_SIZE) != Gdiplus::Ok)
-            return false;
-    } // 必须先释放 Graphics，再对同一 Bitmap 调 LockBits。
-
+bool copyBitmapBgra(Gdiplus::Bitmap& bitmap, IconImage& out) {
     Gdiplus::BitmapData data{};
     Gdiplus::Rect rect(0, 0, MC_ICON_SIZE, MC_ICON_SIZE);
-    if (bmp.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) != Gdiplus::Ok)
+    if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead,
+                        PixelFormat32bppARGB, &data) != Gdiplus::Ok) {
         return false;
+    }
 
     out.width = MC_ICON_SIZE;
     out.height = MC_ICON_SIZE;
@@ -96,23 +79,60 @@ bool loadIconBgra(const std::wstring& path, IconImage& out) {
             static_cast<size_t>(y) * MC_ICON_SIZE * 4;
         std::copy(row, row + static_cast<size_t>(MC_ICON_SIZE) * 4, output);
     }
-    bmp.UnlockBits(&data);
+    bitmap.UnlockBits(&data);
+
+    out.drawable = std::make_unique<Gdiplus::Bitmap>(
+        out.width, out.height, out.width * 4, PixelFormat32bppARGB,
+        out.bgraPixels.data());
+    if (out.drawable->GetLastStatus() != Gdiplus::Ok) {
+        out.drawable.reset();
+        return false;
+    }
     return true;
+}
+
+// 加载 PNG；原生槽位尺寸直接提取像素，其他尺寸只在首次使用时缩放。
+bool loadIconBgra(const std::wstring& path, IconImage& out) {
+    Gdiplus::Bitmap src(path.c_str());
+    if (src.GetLastStatus() != Gdiplus::Ok)
+        return false;
+
+    if (src.GetWidth() == MC_ICON_SIZE && src.GetHeight() == MC_ICON_SIZE)
+        return copyBitmapBgra(src, out);
+
+    Gdiplus::Bitmap resized(MC_ICON_SIZE, MC_ICON_SIZE, PixelFormat32bppARGB);
+    if (resized.GetLastStatus() != Gdiplus::Ok)
+        return false;
+
+    {
+        Gdiplus::Graphics graphics(&resized);
+        if (graphics.GetLastStatus() != Gdiplus::Ok)
+            return false;
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        if (graphics.DrawImage(&src, 0, 0, MC_ICON_SIZE, MC_ICON_SIZE) != Gdiplus::Ok)
+            return false;
+    }
+    return copyBitmapBgra(resized, out);
 }
 
 } // namespace
 
 IconRegistry::~IconRegistry() {
+    // drawable 必须在 GdiplusShutdown 前析构。
+    icons_.clear();
     if (gdiplusReady_)
         gdiplusRelease();
 }
 
-void IconRegistry::loadFromDirectory(const std::wstring& dir) {
-    if (!gdiplusReady_) {
-        gdiplusReady_ = gdiplusAcquire();
-        if (!gdiplusReady_) return;
-    }
+bool IconRegistry::ensureReady() const {
+    if (gdiplusReady_)
+        return true;
+    gdiplusReady_ = gdiplusAcquire();
+    return gdiplusReady_;
+}
 
+void IconRegistry::indexDirectory(const std::wstring& dir) {
     icons_.clear();
     const std::wstring pattern = dir + L"\\*.png";
     WIN32_FIND_DATAW fd{};
@@ -127,10 +147,9 @@ void IconRegistry::loadFromDirectory(const std::wstring& dir) {
         const std::string itemId = asciiLower(wideToUtf8(fname.substr(0, dot)));
         if (itemId.empty()) continue;
 
-        IconImage img;
-        if (loadIconBgra(dir + L"\\" + fname, img))
-            icons_[itemId] = std::move(img);
-        // 单文件失败仅跳过，不阻断其余图标。
+        IconEntry entry;
+        entry.path = dir + L"\\" + fname;
+        icons_[itemId] = std::move(entry);
     } while (FindNextFileW(hFind, &fd));
     FindClose(hFind);
 }
@@ -141,7 +160,20 @@ bool IconRegistry::hasIcon(const std::string& itemId) const {
 
 const IconImage* IconRegistry::getIcon(const std::string& itemId) const {
     const auto it = icons_.find(itemId);
-    return it != icons_.end() ? &it->second : nullptr;
+    if (it == icons_.end()) return nullptr;
+
+    const IconEntry& entry = it->second;
+    if (entry.state == LoadState::Loaded)
+        return &entry.image;
+    if (entry.state == LoadState::Failed)
+        return nullptr;
+
+    if (!ensureReady() || !loadIconBgra(entry.path, entry.image)) {
+        entry.state = LoadState::Failed;
+        return nullptr;
+    }
+    entry.state = LoadState::Loaded;
+    return &entry.image;
 }
 
 std::vector<std::string> IconRegistry::listIds() const {

@@ -99,18 +99,25 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notify) {
                 g_coordinator->onReady();
                 break;
 
-            case NPPN_BUFFERACTIVATED:
-            case NPPN_LANGCHANGED:
             case NPPN_FILEOPENED:
             case NPPN_FILESAVED:
-            case NPPN_WORDSTYLESUPDATED:
             case NPPN_GLOBALMODIFIED: // Replace All 从 8.6.5 起不再逐项发 SCN_MODIFIED
                 g_coordinator->onFileChanged();
                 break;
 
+            case NPPN_BUFFERACTIVATED:
+                g_coordinator->onFileChanged();
+                break;
+
+            case NPPN_LANGCHANGED:
+            case NPPN_WORDSTYLESUPDATED:
+                // lexer/主题切换可能重写基础 style，克隆缓存必须失效。
+                g_coordinator->onStylesChanged();
+                break;
+
             case SCN_UPDATEUI:
                 if (notify->updated & SC_UPDATE_V_SCROLL)
-                    g_coordinator->onViewportChanged();
+                    g_coordinator->onViewportChanged(reinterpret_cast<HWND>(notify->nmhdr.hwndFrom));
                 break;
 
             case SCN_PAINTED:
@@ -118,8 +125,11 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification* notify) {
                 break;
 
             case SCN_MODIFIED:
-                if (notify->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT))
-                    g_coordinator->onModifiedDebounced();
+                if (notify->modificationType & (SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT)) {
+                    g_coordinator->onModifiedDebounced(
+                        reinterpret_cast<HWND>(notify->nmhdr.hwndFrom),
+                        notify->position, notify->length, notify->modificationType);
+                }
                 break;
 
             default:

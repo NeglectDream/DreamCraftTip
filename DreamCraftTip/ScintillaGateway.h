@@ -4,12 +4,11 @@
 // 职责（SRP）：隔离 Win32 SendMessage 细节，向其余模块提供类型安全的
 //              文本 / style / indicator / 坐标 / margin 操作接口。
 //
-// 设计依据：Scintilla 作为 Windows 控件，全部交互通过 SendMessage 进行
-//          （ScintillaDoc Introduction）。直接在各业务模块裸用 SendMessage
-//          会导致 wParam/lParam 类型混乱、常量难溯源、难以维护，故提取本层。
+// 设计依据：首次 attach 通过 SendMessage 获取 Scintilla direct function，后续
+//          高频调用在同一 UI 线程直接转发；若宿主不支持则自动退回 SendMessage。
+//          业务模块仍不接触 wParam/lParam 细节。
 //
-// 线程模型：Scintilla 非线程安全，全部调用必须在 UI 线程。本类无状态，
-//          仅持有一个 HWND，可被多模块共享。
+// 线程模型：Scintilla 非线程安全，全部调用必须在 UI 线程。
 // ============================================================================
 #pragma once
 
@@ -17,6 +16,7 @@
 #include "sdk/Scintilla.h"
 #include "sdk/Sci_Position.h"
 #include <string>
+#include <vector>
 
 class ScintillaGateway {
 public:
@@ -32,6 +32,7 @@ public:
 
     // ---- 文本与位置信息 ----
     Sci_Position getLength() const noexcept;            // SCI_GETLENGTH(2006)
+    sptr_t       getDocumentPointer() const noexcept;    // SCI_GETDOCPOINTER(2357)
     int          getLineCount() const noexcept;         // SCI_GETLINECOUNT(2154)
     Sci_Position lineFromPosition(Sci_Position pos) const noexcept;   // 2166
     Sci_Position positionFromLine(Sci_Position line) const noexcept;  // 2167
@@ -47,6 +48,8 @@ public:
 
     // ---- 字符 Style ----
     int  getStyleIndexAt(Sci_Position pos) const noexcept;              // 2038
+    // 单次读取 [start, end) 的 style 索引，避免逐字符消息调用。
+    std::vector<unsigned char> getStyleIndices(Sci_Position start, Sci_Position end) const;
     void colourise(Sci_Position start, Sci_Position end) const noexcept;// 4003
     void startStyling(Sci_Position start) const noexcept;               // 2032
     void setStyling(Sci_Position len, int style) const noexcept;        // 2033
@@ -77,5 +80,7 @@ public:
 private:
     void copyStyle(int sourceStyle, int targetStyle) const noexcept;
 
-    HWND scintilla_;
+    HWND scintilla_ = nullptr;
+    SciFnDirect directFunction_ = nullptr;
+    sptr_t directPointer_ = 0;
 };

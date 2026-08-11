@@ -97,7 +97,7 @@ void DecorationCoordinator::onReady() {
     gateway_ = std::make_unique<ScintillaGateway>(scintilla);
     colorIndicator_ = std::make_unique<ColorIndicator>(*gateway_);
 
-    iconRegistry_.loadFromDirectory(resourcePath(L"icons"));
+    iconRegistry_.indexDirectory(resourcePath(L"icons"));
     auto vanillaIds = McVanillaItems::defaultSet();
     for (const auto& itemId : iconRegistry_.listIds())
         vanillaIds.insert(itemId);
@@ -111,27 +111,110 @@ void DecorationCoordinator::onReady() {
         [this] { if (ready_) scan(); });
 
     ready_ = true;
-    scan();
+    pendingViews_.insert(scintilla);
+    debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
 }
 
 void DecorationCoordinator::onFileChanged() {
-    if (!ready_) return;
-    if (debouncer_) debouncer_->cancel();
-    scan();
-}
-
-void DecorationCoordinator::onModifiedDebounced() {
-    if (ready_ && debouncer_)
-        debouncer_->trigger();
-}
-
-void DecorationCoordinator::onViewportChanged() {
-    if (!ready_ || !gateway_ || !debouncer_) return;
+    if (!ready_ || !gateway_ || !inlineIcons_ || !debouncer_) return;
     const HWND scintilla = currentScintilla();
     if (!scintilla) return;
+
+    // 立即移除新 buffer 上可能属于旧文档的视图锚点，实际扫描由通知合并器执行。
     gateway_->attach(scintilla);
-    if (gateway_->getLength() > MC_MAX_SCAN_BYTES && isYamlFile())
+    inlineIcons_->attach(scintilla);
+    inlineIcons_->clearAnchors();
+    inlineIcons_->refresh();
+    pendingViews_.clear();
+    pendingViews_.insert(scintilla);
+    debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
+}
+
+void DecorationCoordinator::onStylesChanged() {
+    if (!ready_ || !gateway_ || !colorIndicator_ || !inlineIcons_) return;
+
+    initializedViews_.clear();
+    const HWND views[] = {
+        nppData_._scintillaMainHandle,
+        nppData_._scintillaSecondHandle,
+    };
+    for (const HWND view : views) {
+        if (!view) continue;
+        gateway_->attach(view);
+        inlineIcons_->attach(view);
+        colorIndicator_->init();
+        inlineIcons_->init();
+        initializedViews_.insert(view);
+    }
+    onFileChanged();
+}
+
+void DecorationCoordinator::onModifiedDebounced(
+    HWND scintilla, Sci_Position position, Sci_Position length, int modificationType) {
+    if (!ready_ || !gateway_ || !inlineIcons_ || !debouncer_ || !scintilla) return;
+    gateway_->attach(scintilla);
+    inlineIcons_->attach(scintilla);
+    const sptr_t document = gateway_->getDocumentPointer();
+    inlineIcons_->clearDocumentAnchors(document);
+
+    // 克隆视图共享文档内容但拥有独立 style/锚点；一次编辑必须同步重建两边。
+    pendingViews_.clear();
+    pendingViews_.insert(scintilla);
+    const HWND views[] = {
+        nppData_._scintillaMainHandle,
+        nppData_._scintillaSecondHandle,
+    };
+    for (const HWND view : views) {
+        if (!view || view == scintilla) continue;
+        gateway_->attach(view);
+        if (gateway_->getDocumentPointer() == document)
+            pendingViews_.insert(view);
+    }
+
+    // Indicator 会随编辑自动移动，但缓存的数字范围不会；按同一编辑变换范围，
+    // 防止防抖期间在旧窗口边界外遗留宽槽 style 或颜色 indicator。
+    if (length > 0) {
+        for (const HWND view : pendingViews_) {
+            const auto viewRanges = decoratedRanges_.find(view);
+            if (viewRanges == decoratedRanges_.end()) continue;
+            const auto range = viewRanges->second.find(document);
+            if (range == viewRanges->second.end()) continue;
+
+            DecoratedRange& decorated = range->second;
+            if (modificationType & SC_MOD_INSERTTEXT) {
+                if (position <= decorated.start) {
+                    decorated.start += length;
+                    decorated.end += length;
+                } else if (position < decorated.end) {
+                    decorated.end += length;
+                }
+            } else if (modificationType & SC_MOD_DELETETEXT) {
+                const Sci_Position deletionEnd = position + length;
+                const auto translate = [position, deletionEnd, length](Sci_Position value) {
+                    if (value <= position) return value;
+                    if (value < deletionEnd) return position;
+                    return value - length;
+                };
+                decorated.start = translate(decorated.start);
+                decorated.end = translate(decorated.end);
+                if (decorated.end < decorated.start)
+                    decorated.end = decorated.start;
+            }
+        }
+    }
+
+    gateway_->attach(scintilla);
+    debouncer_->trigger();
+}
+
+void DecorationCoordinator::onViewportChanged(HWND scintilla) {
+    if (!ready_ || !gateway_ || !debouncer_ || !scintilla) return;
+    gateway_->attach(scintilla);
+    if (gateway_->getLength() > MC_MAX_SCAN_BYTES && isYamlFile()) {
+        pendingViews_.clear();
+        pendingViews_.insert(scintilla);
         debouncer_->trigger();
+    }
 }
 
 void DecorationCoordinator::onPainted(HWND scintilla) {
@@ -182,28 +265,62 @@ void DecorationCoordinator::scan() {
     if (!ready_ || !gateway_ || !colorIndicator_ || !inlineIcons_ || !idMatcher_)
         return;
 
-    const HWND scintilla = currentScintilla();
+    if (pendingViews_.empty()) {
+        const HWND scintilla = currentScintilla();
+        if (scintilla)
+            pendingViews_.insert(scintilla);
+    }
+
+    const auto views = pendingViews_;
+    pendingViews_.clear();
+    const bool yamlFile = isYamlFile();
+    for (const HWND scintilla : views)
+        scanView(scintilla, yamlFile);
+}
+
+void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
     if (!scintilla) return;
     gateway_->attach(scintilla);
 
-    // Style/indicator 定义属于 Scintilla 控件实例；主/副视图切换后需重同步。
-    colorIndicator_->init();
+    // Style/indicator 定义属于 Scintilla 控件实例；每个视图只初始化一次。
+    // NPPN_WORDSTYLESUPDATED 会清空 initializedViews_，届时按需重建。
     inlineIcons_->attach(scintilla);
-    inlineIcons_->init();
+    if (initializedViews_.insert(scintilla).second) {
+        colorIndicator_->init();
+        inlineIcons_->init();
+    }
 
     const Sci_Position docLen = gateway_->getLength();
-    if (!isYamlFile()) {
-        inlineIcons_->clearAll(docLen);
-        colorIndicator_->clearAll(docLen);
+    const sptr_t document = gateway_->getDocumentPointer();
+    auto& documentRanges = decoratedRanges_[scintilla];
+    // 每个 buffer 保留独立旧范围；切走后再返回时仍能清除上次可见窗口的装饰。
+    auto previousRange = documentRanges.find(document);
+    inlineIcons_->clearAnchors();
+    if (!yamlFile) {
+        // 只恢复本插件确实装饰过的范围；首次看到普通文件时绝不改写其 style。
+        if (previousRange != documentRanges.end()) {
+            const Sci_Position clearStart =
+                (std::max)(static_cast<Sci_Position>(0), previousRange->second.start);
+            const Sci_Position clearEnd = (std::min)(docLen, previousRange->second.end);
+            inlineIcons_->clearRange(clearStart, clearEnd);
+            colorIndicator_->clearRange(clearStart, clearEnd, false);
+            documentRanges.erase(previousRange);
+        }
+        inlineIcons_->refresh();
+        return;
+    }
+    if (docLen <= 0) {
+        if (previousRange != documentRanges.end())
+            documentRanges.erase(previousRange);
+        inlineIcons_->refresh();
         return;
     }
 
-    inlineIcons_->clearAll(docLen);
-    colorIndicator_->clearAll(docLen);
-    if (docLen <= 0) return;
-
     const int lineCount = gateway_->getLineCount();
-    if (lineCount <= 0) return;
+    if (lineCount <= 0) {
+        inlineIcons_->refresh();
+        return;
+    }
 
     int startLine = 0;
     int endLine = lineCount - 1;
@@ -231,33 +348,77 @@ void DecorationCoordinator::scan() {
             ? gateway_->positionFromLine(lineAfterVisible)
             : docLen;
 
-        const Sci_Position scanStart = visibleStart > MC_VISIBLE_PADDING_CHARS
+        const Sci_Position paddedStart = visibleStart > MC_VISIBLE_PADDING_CHARS
             ? visibleStart - MC_VISIBLE_PADDING_CHARS : 0;
         const Sci_Position remaining = docLen - visibleEnd;
-        const Sci_Position scanEnd = remaining > MC_VISIBLE_PADDING_CHARS
+        const Sci_Position paddedEnd = remaining > MC_VISIBLE_PADDING_CHARS
             ? visibleEnd + MC_VISIBLE_PADDING_CHARS : docLen;
 
-        startLine = static_cast<int>(gateway_->lineFromPosition(scanStart));
-        endLine = static_cast<int>(gateway_->lineFromPosition(scanEnd));
+        startLine = static_cast<int>(gateway_->lineFromPosition(paddedStart));
+        endLine = static_cast<int>(gateway_->lineFromPosition(paddedEnd));
         endLine = (std::min)(endLine, lineCount - 1);
     }
 
+    const Sci_Position scanStart = gateway_->positionFromLine(startLine);
+    const Sci_Position lineAfterScan = static_cast<Sci_Position>(endLine) + 1;
+    const Sci_Position scanEnd = lineAfterScan < lineCount
+        ? gateway_->positionFromLine(lineAfterScan)
+        : docLen;
+
+    // 先清理该视图/文档离开窗口的旧范围，避免残留扩宽槽位和颜色 indicator。
+    if (previousRange != documentRanges.end() &&
+        (previousRange->second.start != scanStart || previousRange->second.end != scanEnd)) {
+        const Sci_Position oldStart =
+            (std::max)(static_cast<Sci_Position>(0), previousRange->second.start);
+        const Sci_Position oldEnd = (std::min)(docLen, previousRange->second.end);
+        inlineIcons_->clearRange(oldStart, oldEnd);
+        colorIndicator_->clearRange(oldStart, oldEnd, false);
+    }
+    inlineIcons_->clearRange(scanStart, scanEnd);
+    colorIndicator_->clearRange(scanStart, scanEnd, true);
+    documentRanges[document] = {scanStart, scanEnd};
+
+    // 整个扫描窗口只跨一次 Scintilla 边界，后续拆行和 value 提取均在内存完成。
+    const std::string scanText = gateway_->getTextRange(scanStart, scanEnd);
     int blockParentIndent = -1;
     int blockContentIndent = -1;
-    for (int lineNo = startLine; lineNo <= endLine; ++lineNo) {
-        const Sci_Position lineStart = gateway_->positionFromLine(lineNo);
-        const Sci_Position lineEnd = gateway_->getLineEndPosition(lineNo);
-        if (lineEnd <= lineStart) continue;
+    size_t lineOffset = 0;
+    int lineNo = startLine;
+    while (lineOffset < scanText.size() && lineNo <= endLine) {
+        size_t contentEnd = scanText.find_first_of("\r\n", lineOffset);
+        if (contentEnd == std::string::npos)
+            contentEnd = scanText.size();
 
-        const std::string lineText = gateway_->getTextRange(lineStart, lineEnd);
+        size_t nextLineOffset = contentEnd;
+        if (nextLineOffset < scanText.size() && scanText[nextLineOffset] == '\r')
+            ++nextLineOffset;
+        if (nextLineOffset < scanText.size() && scanText[nextLineOffset] == '\n')
+            ++nextLineOffset;
+
+        const int currentLine = lineNo++;
+        const Sci_Position lineStart = scanStart + static_cast<Sci_Position>(lineOffset);
+        const Sci_Position lineEnd = scanStart + static_cast<Sci_Position>(contentEnd);
+        const std::string lineText = scanText.substr(lineOffset, contentEnd - lineOffset);
+        lineOffset = nextLineOffset;
+        if (lineText.empty()) continue;
+
         const size_t indent = leadingIndent(lineText);
         const bool blankLine = indent == lineText.size();
 
         YamlValueRange valueRange{};
         bool blockBody = false;
 
-        // 块标量正文：首个非空正文行确定自动缩进；后续低于该缩进即结束块。
-        if (blockParentIndent >= 0) {
+        // YAML lexer 已知该行是块标量正文时直接使用；即使扫描窗口从超长
+        // 块正文中部开始，也无需依赖 padding 内能找到原始 |/> 块头。
+        const Sci_Position firstContent = lineStart + static_cast<Sci_Position>(indent);
+        if (!blankLine && gateway_->getStyleIndexAt(firstContent) == STYLE_YAML_BLOCK_TEXT) {
+            valueRange.start = firstContent;
+            valueRange.end = lineEnd;
+            valueRange.scalarStart = valueRange.start;
+            valueRange.valid = valueRange.end > valueRange.start;
+            blockBody = true;
+        } else if (blockParentIndent >= 0) {
+            // 编辑中的未完成 YAML 可能尚无稳定 lexer style，保留缩进状态机兜底。
             if (blankLine) continue;  // 空行仍属于当前块，不终止状态
             const int currentIndent = static_cast<int>(indent);
             if (currentIndent <= blockParentIndent ||
@@ -279,7 +440,11 @@ void DecorationCoordinator::scan() {
             valueRange = locator_.locateValue(lineText, lineStart);
         if (!valueRange.valid || valueRange.end <= valueRange.start) continue;
 
-        const std::string value = gateway_->getTextRange(valueRange.start, valueRange.end);
+        const size_t valueOffset = static_cast<size_t>(valueRange.start - lineStart);
+        const size_t valueLength = static_cast<size_t>(valueRange.end - valueRange.start);
+        if (valueOffset > lineText.size() || valueLength > lineText.size() - valueOffset)
+            continue;
+        const std::string value = lineText.substr(valueOffset, valueLength);
         if (!blockBody && !value.empty() && (value[0] == '|' || value[0] == '>')) {
             const size_t parentIndent = blockNodeIndent(lineText);
             blockParentIndent = static_cast<int>(parentIndent);
@@ -290,7 +455,7 @@ void DecorationCoordinator::scan() {
             colorIndicator_->paint(segment, valueRange.start);
 
         const ItemIdMatch match = idMatcher_->match(value);
-        if (match.matched && iconRegistry_.hasIcon(match.itemId)) {
+        if (match.matched) {
             // 裸 ID/namespace 格式沿用 scalarStart，确保 quoted value 仍可借用
             // opening quote 前的空白槽；仅字段对进入 value 内部并借用 ':' 槽。
             const Sci_Position iconTarget = match.sourceOffset == 0
@@ -299,7 +464,7 @@ void DecorationCoordinator::scan() {
             const IconSlotLocation location =
                 locateIconSlot(lineText, lineStart, iconTarget);
             if (location.valid) {
-                inlineIcons_->addIcon(lineNo, location.position,
+                inlineIcons_->addIcon(currentLine, location.position,
                                       location.slot, match.itemId);
             }
         }

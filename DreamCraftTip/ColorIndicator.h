@@ -24,8 +24,9 @@ public:
     // 主/副视图切换后需再次调用，因为两套控件各自保存 style 定义。
     void init();
 
-    // 恢复本插件覆盖的字符 style，并清除全文 indicator。
-    void clearAll(Sci_Position docLen);
+    // 恢复 [start, end) 内本插件覆盖的 style 并清除 indicator。
+    // recolourise 仅在即将重新扫描 YAML 范围时启用。
+    void clearRange(Sci_Position start, Sci_Position end, bool recolourise);
 
     // 把单个分段刷到 Scintilla。
     // valueStart: value 在文档中的绝对起点。
@@ -33,7 +34,7 @@ public:
 
 private:
     bool applyBoldStyle(Sci_Position start, Sci_Position len);
-    void restoreBoldStyles(Sci_Position docLen);
+    void restoreBoldStyles(Sci_Position start, Sci_Position end);
 
     ScintillaGateway& gateway_;
 };

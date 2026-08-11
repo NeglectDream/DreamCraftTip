@@ -41,8 +41,10 @@ InlineIconLayer::~InlineIconLayer() {
         ::RemoveFontResourceExW(slotFontPath_.c_str(), FR_PRIVATE | FR_NOT_ENUM, nullptr);
 }
 
-void InlineIconLayer::attach(HWND scintilla) noexcept {
+void InlineIconLayer::attach(HWND scintilla) {
     currentView_ = scintilla;
+    if (currentView_)
+        documentsByView_[currentView_] = gateway_.getDocumentPointer();
     if (slotFontLoaded_ && currentView_ && fontNotifiedViews_.insert(currentView_).second)
         ::SendMessage(currentView_, WM_FONTCHANGE, 0, 0);
 }
@@ -73,11 +75,24 @@ void InlineIconLayer::init() {
     }
 }
 
-void InlineIconLayer::clearAll(Sci_Position docLen) {
-    restoreSlotStyles(docLen);
+void InlineIconLayer::clearRange(Sci_Position start, Sci_Position end) {
+    if (end <= start) return;
+    restoreSlotStyles(start, end);
+}
+
+void InlineIconLayer::clearAnchors() {
     if (currentView_)
         anchorsByView_[currentView_].clear();
-    refresh();
+}
+
+void InlineIconLayer::clearDocumentAnchors(sptr_t document) {
+    for (const auto& viewDocument : documentsByView_) {
+        if (viewDocument.second != document) continue;
+        const auto anchors = anchorsByView_.find(viewDocument.first);
+        if (anchors != anchorsByView_.end())
+            anchors->second.clear();
+        ::InvalidateRect(viewDocument.first, nullptr, FALSE);
+    }
 }
 
 bool InlineIconLayer::addIcon(Sci_Position line, Sci_Position slotPosition,
@@ -111,6 +126,7 @@ void InlineIconLayer::paint(HWND scintilla) const {
             return anchor.line < line;
         });
 
+    if (!registry_.ensureReady()) return;
     ScopedWindowDC windowDC(scintilla);
     if (!windowDC.get()) return;
     Gdiplus::Graphics graphics(windowDC.get());
@@ -118,11 +134,17 @@ void InlineIconLayer::paint(HWND scintilla) const {
     graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
+    Sci_Position cachedLine = -1;
+    int lineTop = 0;
+    int lineHeight = 0;
     for (; anchorIt != anchors.end() && anchorIt->line <= lastLine; ++anchorIt) {
         const int cellStart = view.pointXFromPosition(anchorIt->slotPosition);
         const int cellEnd = view.pointXFromPosition(anchorIt->slotPosition + 1);
-        const int lineTop = view.pointYFromPosition(anchorIt->slotPosition);
-        const int lineHeight = view.textHeight(anchorIt->line);
+        if (anchorIt->line != cachedLine) {
+            cachedLine = anchorIt->line;
+            lineTop = view.pointYFromPosition(anchorIt->slotPosition);
+            lineHeight = view.textHeight(anchorIt->line);
+        }
         if (cellEnd <= cellStart || lineHeight <= 0) continue;
         if (lineTop >= client.bottom || lineTop + lineHeight <= client.top) continue;
 
@@ -140,16 +162,10 @@ void InlineIconLayer::paint(HWND scintilla) const {
         if (x >= client.right || x + iconSize <= client.left) continue;
 
         const IconImage* image = registry_.getIcon(anchorIt->itemId);
-        if (!image || image->bgraPixels.empty()) continue;
-
-        Gdiplus::Bitmap bitmap(
-            image->width, image->height, image->width * 4,
-            PixelFormat32bppARGB,
-            const_cast<BYTE*>(image->bgraPixels.data()));
-        if (bitmap.GetLastStatus() != Gdiplus::Ok) continue;
+        if (!image || !image->drawable) continue;
 
         const Gdiplus::Rect destination(x, y, iconSize, iconSize);
-        graphics.DrawImage(&bitmap, destination, 0, 0,
+        graphics.DrawImage(image->drawable.get(), destination, 0, 0,
                            image->width, image->height, Gdiplus::UnitPixel);
     }
 }
@@ -159,13 +175,13 @@ void InlineIconLayer::refresh() const {
         ::InvalidateRect(currentView_, nullptr, FALSE);
 }
 
-void InlineIconLayer::restoreSlotStyles(Sci_Position docLen) {
-    Sci_Position pos = 0;
-    while (pos < docLen) {
+void InlineIconLayer::restoreSlotStyles(Sci_Position start, Sci_Position end) {
+    Sci_Position pos = start;
+    while (pos < end) {
         const int indicatorValue = gateway_.indicatorValueAt(INDIC_MC_ICON_SLOT, pos);
         Sci_Position rangeEnd = gateway_.indicatorEnd(INDIC_MC_ICON_SLOT, pos);
         if (rangeEnd <= pos) rangeEnd = pos + 1;
-        if (rangeEnd > docLen) rangeEnd = docLen;
+        if (rangeEnd > end) rangeEnd = end;
 
         if (indicatorValue != 0) {
             Sci_Position stylePos = pos;
@@ -190,7 +206,7 @@ void InlineIconLayer::restoreSlotStyles(Sci_Position docLen) {
     }
 
     gateway_.setIndicatorCurrent(INDIC_MC_ICON_SLOT);
-    gateway_.indicatorClearRange(0, docLen);
+    gateway_.indicatorClearRange(start, end - start);
 }
 
 bool InlineIconLayer::applySlotStyle(Sci_Position position, InlineIconSlot slot) {

@@ -23,6 +23,9 @@
 #include <cstddef>
 #include <set>
 #include <string>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
 
 struct ItemIdMatch {
     bool        matched = false;
@@ -34,8 +37,27 @@ class McItemIdMatcher {
 public:
     explicit McItemIdMatcher(std::set<std::string> vanillaIds);
 
+    McItemIdMatcher(const McItemIdMatcher& other);
+    McItemIdMatcher& operator=(const McItemIdMatcher& other);
+    McItemIdMatcher(McItemIdMatcher&& other) noexcept;
+    McItemIdMatcher& operator=(McItemIdMatcher&& other) noexcept;
+
     ItemIdMatch match(const std::string& value) const;
 
 private:
-    std::set<std::string> vanillaIds_;
+    // 哈希与比较在查询时折叠 ASCII 大小写，使 match() 可直接用
+    // string_view 查找，不必为 lowercase 临时值分配 std::string。
+    struct LowercaseAsciiHash {
+        std::size_t operator()(std::string_view value) const noexcept;
+    };
+
+    struct LowercaseAsciiEqual {
+        bool operator()(std::string_view left, std::string_view right) const noexcept;
+    };
+
+    void rebuildVanillaIdIndex();
+
+    // string_view 索引依赖此存储；成员顺序保证存储先构造、后析构。
+    std::vector<std::string> vanillaIdStorage_;
+    std::unordered_set<std::string_view, LowercaseAsciiHash, LowercaseAsciiEqual> vanillaIds_;
 };
