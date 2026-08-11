@@ -4,6 +4,7 @@
 #include "McItemIdMatcher.h"
 #include <algorithm>
 #include <cctype>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -46,6 +47,22 @@ void stripNumericDataSuffix(std::string& path) {
         path.resize(colon);
 }
 
+// MenuItem 紧凑字段对的字段名白名单（小写）。
+// Shop 插件（BossShopPro / Shopkeepers / EconomyShopGUI 等）与技能/Pet 配置中
+// 表示"物品材质类型"的字段名惯例。冒号后跟物品 ID，如 type:MAP / material:diamond。
+// 用白名单精确锁定语义，避免把 CustomModelData:772 / amount:1 / name:&a文本
+// 等普通字段误判为物品。
+const std::unordered_set<std::string>& menuItemFields() {
+    static const std::unordered_set<std::string> fields = {
+        "type", "material", "id", "item", "itemid", "itemtype", "materialtype"
+    };
+    return fields;
+}
+
+bool isMenuItemField(const std::string& lowerPrefix) {
+    return menuItemFields().count(lowerPrefix) > 0;
+}
+
 } // namespace
 
 McItemIdMatcher::McItemIdMatcher(std::set<std::string> vanillaIds)
@@ -67,6 +84,10 @@ ItemIdMatch McItemIdMatcher::match(const std::string& value) const {
         } else if (isNumericSuffix(v, colon + 1)) {
             // 旧式插件配置常见写法：iron_ingot:1
             path = v.substr(0, colon);
+        } else if (isMenuItemField(prefix)) {
+            // MenuItem 紧凑字段对：type:MAP / material:diamond / id:iron_ingot
+            // 冒号前是已知字段名，冒号后是物品 ID。
+            path = v.substr(colon + 1);
         } else {
             // 其他 namespace 暂不支持，避免把普通冒号文本误判为物品。
             return {false, ""};
