@@ -111,14 +111,22 @@ void DecorationCoordinator::onReady() {
         [this] { if (ready_) scan(); });
 
     ready_ = true;
-    pendingViews_.insert(scintilla);
-    debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
+    // 首屏扫描仅在当前 buffer 是 YAML 时排队，避免对默认新建文档做无谓初始化。
+    if (needsDecorationFor(scintilla)) {
+        pendingViews_.insert(scintilla);
+        debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
+    }
 }
 
 void DecorationCoordinator::onFileChanged() {
     if (!ready_ || !gateway_ || !inlineIcons_ || !debouncer_) return;
     const HWND scintilla = currentScintilla();
     if (!scintilla) return;
+
+    // 切 buffer = 当前语言可能改变；清缓存让下次 needsDecorationFor 重新探测。
+    yamlBufferCache_.clear();
+    // 非 YAML 早退：不 attach、不清锚点、不排队扫描。
+    if (!needsDecorationFor(scintilla)) return;
 
     // 立即移除新 buffer 上可能属于旧文档的视图锚点，实际扫描由通知合并器执行。
     gateway_->attach(scintilla);
@@ -136,6 +144,7 @@ void DecorationCoordinator::onStylesChanged() {
     // 主题/样式变更：两视图的 indicator/slot 定义都必须重建，且两视图都要重扫。
     // 原实现把排队委托给 onFileChanged()，但后者只排队 currentScintilla，
     // 导致副视图虽被 init() 却不会进入 pendingViews_，scan() 遗漏它，旧装饰残留。
+    yamlBufferCache_.clear();
     initializedViews_.clear();
     pendingViews_.clear();
     const HWND views[] = {
@@ -143,7 +152,7 @@ void DecorationCoordinator::onStylesChanged() {
         nppData_._scintillaSecondHandle,
     };
     for (const HWND view : views) {
-        if (!view) continue;
+        if (!view || !needsDecorationFor(view)) continue;
         gateway_->attach(view);
         inlineIcons_->attach(view);
         colorIndicator_->init();
@@ -151,12 +160,15 @@ void DecorationCoordinator::onStylesChanged() {
         initializedViews_.insert(view);
         pendingViews_.insert(view);
     }
+    if (pendingViews_.empty()) return;
     debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
 }
 
 void DecorationCoordinator::onModifiedDebounced(
     HWND scintilla, Sci_Position position, Sci_Position length, int modificationType) {
     if (!ready_ || !gateway_ || !inlineIcons_ || !debouncer_ || !scintilla) return;
+    // 非 YAML 文件不做任何 Scintilla 操作；保留早退前置以避免 attach/getDocumentPointer。
+    if (!needsDecorationFor(scintilla)) return;
     gateway_->attach(scintilla);
     inlineIcons_->attach(scintilla);
     const sptr_t document = gateway_->getDocumentPointer();
@@ -212,8 +224,10 @@ void DecorationCoordinator::onModifiedDebounced(
 
 void DecorationCoordinator::onViewportChanged(HWND scintilla) {
     if (!ready_ || !gateway_ || !debouncer_ || !scintilla) return;
+    // 滚动高频，先用语言守卫过滤，再判断大文件可视区懒加载。
+    if (!needsDecorationFor(scintilla)) return;
     gateway_->attach(scintilla);
-    if (gateway_->getLength() > MC_MAX_SCAN_BYTES && isYamlFile()) {
+    if (gateway_->getLength() > MC_MAX_SCAN_BYTES) {
         pendingViews_.clear();
         pendingViews_.insert(scintilla);
         debouncer_->trigger();
@@ -222,10 +236,11 @@ void DecorationCoordinator::onViewportChanged(HWND scintilla) {
 
 void DecorationCoordinator::onPainted(HWND scintilla) {
     if (!ready_ || !inlineIcons_ || !scintilla) return;
-    // InlineIconLayer::paint 复用 Coordinator 注入的 gateway_，而 gateway_ 的
-    // 当前 attach 目标由 Coordinator 控制（扫描/通知路径上已切到对应视图）。
-    // 但 SCN_PAINTED 可能在 Coordinator 未重定向 gateway_ 的视图上触发；
-    // 防御性地在 paint 内自行 attach 到目标 scintilla，避免读到错误视图的坐标。
+    // 不加语言守卫：SCN_PAINTED 是最高频回调（每次重绘都触发）。
+    // needsDecorationFor 即便缓存命中也要 2 次跨进程 SendMessage
+    // （NPPM_GETCURRENTDOCINDEX + NPPM_GETBUFFERIDFROMPOS）才能查缓存，
+    // 远重于 paint 入口 anchorsByView_.find + empty() 的天然早退
+    // （非 YAML 视图从未 addIcon，map 中无条目，find 后立即 return）。
     inlineIcons_->paint(scintilla);
 }
 
@@ -237,20 +252,47 @@ HWND DecorationCoordinator::currentScintilla() const {
                      : nppData_._scintillaSecondHandle;
 }
 
-bool DecorationCoordinator::isYamlFile() const {
-    int langType = L_TEXT;
-    ::SendMessage(nppData_._nppHandle, NPPM_GETCURRENTLANGTYPE, 0,
-                  reinterpret_cast<LPARAM>(&langType));
-    if (langType == L_YAML)
-        return true;
+bool DecorationCoordinator::needsDecorationFor(HWND scintilla) const {
+    if (!scintilla || !nppData_._nppHandle) return false;
 
-    wchar_t path[MAX_PATH]{};
-    if (!::SendMessage(nppData_._nppHandle, NPPM_GETFULLCURRENTPATH, MAX_PATH,
-                       reinterpret_cast<LPARAM>(path)))
+    // 视图 → MAIN_VIEW/SUB_VIEW：scintilla 句柄直接比对两视图。
+    int viewType = -1;
+    if (scintilla == nppData_._scintillaMainHandle)
+        viewType = MAIN_VIEW;
+    else if (scintilla == nppData_._scintillaSecondHandle)
+        viewType = SUB_VIEW;
+    else
         return false;
 
-    const wchar_t* ext = std::wcsrchr(path, L'.');
-    return ext && (equalsIgnoreCase(ext, L".yml") || equalsIgnoreCase(ext, L".yaml"));
+    // 视图当前激活 buffer 索引 → bufferID。
+    const int docIndex = static_cast<int>(::SendMessage(
+        nppData_._nppHandle, NPPM_GETCURRENTDOCINDEX, 0, viewType));
+    if (docIndex < 0) return false;
+    const UINT_PTR bufferId = static_cast<UINT_PTR>(::SendMessage(
+        nppData_._nppHandle, NPPM_GETBUFFERIDFROMPOS, docIndex, viewType));
+    if (!bufferId) return false;
+
+    // 缓存命中：编辑/滚动高频路径仅一次哈希查询。
+    const auto cached = yamlBufferCache_.find(bufferId);
+    if (cached != yamlBufferCache_.end()) return cached->second;
+
+    // 未命中：先查 N++ 记录的语言类型；L_YAML 直接通过。
+    const int langType = static_cast<int>(::SendMessage(
+        nppData_._nppHandle, NPPM_GETBUFFERLANGTYPE, bufferId, 0));
+    bool yaml;
+    if (langType == L_YAML) {
+        yaml = true;
+    } else {
+        // 语言不是 YAML，但用户可能把 .yml 文件以 L_TEXT 打开——按扩展名双判。
+        wchar_t path[MAX_PATH]{};
+        const int len = static_cast<int>(::SendMessage(
+            nppData_._nppHandle, NPPM_GETFULLPATHFROMBUFFERID, bufferId,
+            reinterpret_cast<LPARAM>(path)));
+        const wchar_t* ext = len > 0 ? std::wcsrchr(path, L'.') : nullptr;
+        yaml = ext && (equalsIgnoreCase(ext, L".yml") || equalsIgnoreCase(ext, L".yaml"));
+    }
+    yamlBufferCache_.emplace(bufferId, yaml);
+    return yaml;
 }
 
 std::wstring DecorationCoordinator::resourcePath(const wchar_t* name) const {
@@ -273,19 +315,20 @@ void DecorationCoordinator::scan() {
         return;
 
     if (pendingViews_.empty()) {
+        // 防御性回填：仅在 YAML 时入队，与各入口守卫一致。
         const HWND scintilla = currentScintilla();
-        if (scintilla)
+        if (scintilla && needsDecorationFor(scintilla))
             pendingViews_.insert(scintilla);
     }
 
     const auto views = pendingViews_;
     pendingViews_.clear();
-    const bool yamlFile = isYamlFile();
+    // 入口守卫已保证 pendingViews_ 只含 YAML 视图，直接扫描即可。
     for (const HWND scintilla : views)
-        scanView(scintilla, yamlFile);
+        scanView(scintilla);
 }
 
-void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
+void DecorationCoordinator::scanView(HWND scintilla) {
     if (!scintilla) return;
     gateway_->attach(scintilla);
 
@@ -303,15 +346,6 @@ void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
     // 扁平化键替代原二级 map，避免 operator[] 在早退路径上留下空内层条目。
     auto previousIt = decoratedRanges_.find({scintilla, document});
     inlineIcons_->clearAnchors();
-    if (!yamlFile) {
-        // 只恢复本插件确实装饰过的范围；首次看到普通文件时绝不改写其 style。
-        if (previousIt != decoratedRanges_.end()) {
-            clearDecorationRange(previousIt->second.start, previousIt->second.end, docLen, false);
-            decoratedRanges_.erase(previousIt);
-        }
-        inlineIcons_->refresh();
-        return;
-    }
     if (docLen <= 0) {
         if (previousIt != decoratedRanges_.end())
             decoratedRanges_.erase(previousIt);

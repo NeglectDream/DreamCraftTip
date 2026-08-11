@@ -81,14 +81,22 @@ private:
 
     // 取当前活跃 Scintilla 句柄（主/副视图）
     HWND currentScintilla() const;
-    // 判定当前文件是否 yml/yaml（语言类型 + 扩展名双判）
-    bool isYamlFile() const;
+    // 入口守卫：判定指定视图当前 buffer 是否 YAML（.yml/.yaml 或 N++ L_YAML）。
+    // 所有视图修改入口在排队防抖 / 操作 Scintilla 前先调用本函数，非 YAML 直接
+    // 返回，跳过 scanView 的 Scintilla 读写与 InlineIconLayer 锚点维护开销。
+    //
+    // 实现：HWND → 所属视图 → NPPM_GETCURRENTDOCINDEX → NPPM_GETBUFFERIDFROMPOS
+    //   → NPPM_GETBUFFERLANGTYPE；以 bufferID 为键缓存结果，编辑/滚动高频路径上
+    //   命中缓存时仅一次 hash 查询。FILEOPENED/SAVED/LANGCHANGED/BUFFERACTIVATED
+    //   等改变 buffer 语言类型的入口负责 yamlBufferCache_.clear()。
+    bool needsDecorationFor(HWND scintilla) const;
     // 取 DLL 同级资源路径（icons 目录、私有槽位字体等）。
     std::wstring resourcePath(const wchar_t* name) const;
     // 扫描待处理视图，并同步重建显示同一 Scintilla 文档的克隆视图。
     void scan();
     // 单个视图的主流程：清旧 → 定位 value → 上色 → 加行内图标。
-    void scanView(HWND scintilla, bool yamlFile);
+    // 调用前提：scintilla 对应 buffer 已由入口守卫 needsDecorationFor 判定为 YAML。
+    void scanView(HWND scintilla);
     // 统一封装 inlineIcons_/colorIndicator_ 的区间清理：先 clamp 到 [0, docLen]，
     // 空区间直接返回。recolourise 仅在即将重扫 YAML 范围时启用。
     void clearDecorationRange(Sci_Position start, Sci_Position end,
@@ -108,5 +116,8 @@ private:
     std::unordered_set<HWND> pendingViews_;
     std::unordered_set<HWND> initializedViews_;
     std::unordered_map<DecorationKey, DecoratedRange, DecorationKeyHash> decoratedRanges_;
+    // 按 bufferID 缓存"是否 YAML"判定结果；编辑/滚动高频路径查 O(1)。
+    // buffer 切换/语言变更时由 onFileChanged/onStylesChanged 清空。
+    mutable std::unordered_map<UINT_PTR, bool> yamlBufferCache_;
     bool ready_ = false;
 };
