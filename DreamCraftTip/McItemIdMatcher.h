@@ -1,7 +1,8 @@
 // ============================================================================
 // McItemIdMatcher — Minecraft 原版物品 ID 判定
 //
-// 职责（SRP）：判断 value 是否为原版物品 ID，返回归一化的 itemId。
+// 职责（SRP）：判断 value 是否为原版物品 ID，并返回归一化 itemId 及
+//              物品表达式在原 value 中的起始偏移，供上层精确锚定图标。
 //
 // 判定规则：
 //   1. 优先匹配 "minecraft:<id>"（1.13+ 命名空间形式）
@@ -19,12 +20,14 @@
 // ============================================================================
 #pragma once
 
-#include <string>
+#include <cstddef>
 #include <set>
+#include <string>
 
 struct ItemIdMatch {
     bool        matched = false;
-    std::string itemId;  // 归一化：去 namespace、小写，如 "diamond_sword"
+    std::string itemId;            // 归一化：去 namespace、小写，如 "diamond_sword"
+    std::size_t sourceOffset = 0;  // 物品表达式在传入 value 中的起始字节偏移
 };
 
 class McItemIdMatcher {

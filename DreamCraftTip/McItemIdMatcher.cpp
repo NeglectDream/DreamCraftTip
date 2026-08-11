@@ -9,12 +9,17 @@
 
 namespace {
 
-std::string trim(const std::string& s) {
+struct TrimmedValue {
+    std::string text;
+    size_t sourceOffset = 0;
+};
+
+TrimmedValue trim(const std::string& s) {
     auto isSpaceOrQuote = [](char c) { return c == ' ' || c == '\t' || c == '\'' || c == '"'; };
     size_t a = 0, b = s.size();
     while (a < b && isSpaceOrQuote(s[a])) ++a;
     while (b > a && isSpaceOrQuote(s[b - 1])) --b;
-    return s.substr(a, b - a);
+    return {s.substr(a, b - a), a};
 }
 
 std::string toLower(std::string s) {
@@ -70,9 +75,11 @@ McItemIdMatcher::McItemIdMatcher(std::set<std::string> vanillaIds)
 }
 
 ItemIdMatch McItemIdMatcher::match(const std::string& value) const {
-    std::string v = trim(value);
+    const TrimmedValue trimmed = trim(value);
+    const std::string& v = trimmed.text;
     if (v.empty()) return {false, ""};
 
+    size_t sourceOffset = trimmed.sourceOffset;
     std::string path = v;
     const size_t colon = v.find(':');
     if (colon != std::string::npos) {
@@ -86,7 +93,8 @@ ItemIdMatch McItemIdMatcher::match(const std::string& value) const {
             path = v.substr(0, colon);
         } else if (isMenuItemField(prefix)) {
             // MenuItem 紧凑字段对：type:MAP / material:diamond / id:iron_ingot
-            // 冒号前是已知字段名，冒号后是物品 ID。
+            // 字段名不是物品表达式的一部分；图标应锚定在冒号后的物品 ID 前。
+            sourceOffset += colon + 1;
             path = v.substr(colon + 1);
         } else {
             // 其他 namespace 暂不支持，避免把普通冒号文本误判为物品。
@@ -99,6 +107,6 @@ ItemIdMatch McItemIdMatcher::match(const std::string& value) const {
 
     // 精确匹配，不做前缀模糊（避免 "diam" 误命中 "diamond"）
     if (vanillaIds_.count(path))
-        return {true, path};
+        return {true, path, sourceOffset};
     return {false, ""};
 }

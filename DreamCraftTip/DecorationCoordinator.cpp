@@ -291,8 +291,13 @@ void DecorationCoordinator::scan() {
 
         const ItemIdMatch match = idMatcher_->match(value);
         if (match.matched && iconRegistry_.hasIcon(match.itemId)) {
+            // 裸 ID/namespace 格式沿用 scalarStart，确保 quoted value 仍可借用
+            // opening quote 前的空白槽；仅字段对进入 value 内部并借用 ':' 槽。
+            const Sci_Position iconTarget = match.sourceOffset == 0
+                ? valueRange.scalarStart
+                : valueRange.start + static_cast<Sci_Position>(match.sourceOffset);
             const IconSlotLocation location =
-                locateIconSlot(lineText, lineStart, valueRange.scalarStart);
+                locateIconSlot(lineText, lineStart, iconTarget);
             if (location.valid) {
                 inlineIcons_->addIcon(lineNo, location.position,
                                       location.slot, match.itemId);
