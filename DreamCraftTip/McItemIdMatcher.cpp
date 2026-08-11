@@ -147,22 +147,6 @@ McItemIdMatcher::McItemIdMatcher(std::set<std::string> vanillaIds) {
     rebuildVanillaIdIndex();
 }
 
-McItemIdMatcher::McItemIdMatcher(const McItemIdMatcher& other)
-    : vanillaIdStorage_(other.vanillaIdStorage_) {
-    rebuildVanillaIdIndex();
-}
-
-McItemIdMatcher& McItemIdMatcher::operator=(const McItemIdMatcher& other) {
-    if (this == &other) return *this;
-    McItemIdMatcher copy(other);
-    vanillaIdStorage_.swap(copy.vanillaIdStorage_);
-    vanillaIds_.swap(copy.vanillaIds_);
-    return *this;
-}
-
-McItemIdMatcher::McItemIdMatcher(McItemIdMatcher&& other) noexcept = default;
-McItemIdMatcher& McItemIdMatcher::operator=(McItemIdMatcher&& other) noexcept = default;
-
 void McItemIdMatcher::rebuildVanillaIdIndex() {
     vanillaIds_.clear();
     vanillaIds_.reserve(vanillaIdStorage_.size());

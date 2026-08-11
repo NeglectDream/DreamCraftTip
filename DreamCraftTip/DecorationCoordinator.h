@@ -24,6 +24,7 @@
 #include "IconRegistry.h"
 #include "InlineIconLayer.h"
 #include "DebounceTimer.h"
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +59,26 @@ private:
         Sci_Position end = 0;
     };
 
+    // 复合键：Scintilla 视图句柄 + Scintilla 文档指针。
+    // 保留二元组键以支持克隆视图（两个 view 共享同一 document 时各自独立），
+    // 同时把原本的二级 unordered_map 压平为单级，消除一次哈希查找与空内层条目副作用。
+    struct DecorationKey {
+        HWND view;
+        sptr_t document;
+        bool operator==(const DecorationKey& other) const noexcept {
+            return view == other.view && document == other.document;
+        }
+    };
+
+    // boost::hash_combine 风格的哈希组合，避免标准库默认异或导致的碰撞聚集。
+    struct DecorationKeyHash {
+        std::size_t operator()(const DecorationKey& k) const noexcept {
+            const std::size_t h1 = std::hash<HWND>{}(k.view);
+            const std::size_t h2 = std::hash<sptr_t>{}(k.document);
+            return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        }
+    };
+
     // 取当前活跃 Scintilla 句柄（主/副视图）
     HWND currentScintilla() const;
     // 判定当前文件是否 yml/yaml（语言类型 + 扩展名双判）
@@ -68,6 +89,10 @@ private:
     void scan();
     // 单个视图的主流程：清旧 → 定位 value → 上色 → 加行内图标。
     void scanView(HWND scintilla, bool yamlFile);
+    // 统一封装 inlineIcons_/colorIndicator_ 的区间清理：先 clamp 到 [0, docLen]，
+    // 空区间直接返回。recolourise 仅在即将重扫 YAML 范围时启用。
+    void clearDecorationRange(Sci_Position start, Sci_Position end,
+                              Sci_Position docLen, bool recolourise);
 
     NppData nppData_;
     HMODULE hModule_;
@@ -82,6 +107,6 @@ private:
     std::unique_ptr<DebounceTimer> debouncer_;
     std::unordered_set<HWND> pendingViews_;
     std::unordered_set<HWND> initializedViews_;
-    std::unordered_map<HWND, std::unordered_map<sptr_t, DecoratedRange>> decoratedRanges_;
+    std::unordered_map<DecorationKey, DecoratedRange, DecorationKeyHash> decoratedRanges_;
     bool ready_ = false;
 };

@@ -37,10 +37,15 @@ class McItemIdMatcher {
 public:
     explicit McItemIdMatcher(std::set<std::string> vanillaIds);
 
-    McItemIdMatcher(const McItemIdMatcher& other);
-    McItemIdMatcher& operator=(const McItemIdMatcher& other);
-    McItemIdMatcher(McItemIdMatcher&& other) noexcept;
-    McItemIdMatcher& operator=(McItemIdMatcher&& other) noexcept;
+    // vanillaIds_ 中的 string_view 指向 vanillaIdStorage_ 的字符串内存。
+    // 默认拷贝会深拷贝 vector 而保留旧 view，导致悬空指针，因此禁用拷贝。
+    // 实例由 DecorationCoordinator 通过 unique_ptr 持有，无需任何拷贝。
+    McItemIdMatcher(const McItemIdMatcher&) = delete;
+    McItemIdMatcher& operator=(const McItemIdMatcher&) = delete;
+    // 移动安全：vector<string> 移动只转移 buffer 所有权，字符地址稳定；
+    // unordered_set<string_view> 移动只转移 bucket 数组，view 副本仍有效。
+    McItemIdMatcher(McItemIdMatcher&&) noexcept = default;
+    McItemIdMatcher& operator=(McItemIdMatcher&&) noexcept = default;
 
     ItemIdMatch match(const std::string& value) const;
 

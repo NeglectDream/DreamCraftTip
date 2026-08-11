@@ -51,7 +51,7 @@ public:
                  InlineIconSlot slot, const std::string& itemId);
 
     // 在 SCN_PAINTED 后为指定视图绘制可见图标。
-    void paint(HWND scintilla) const;
+    void paint(HWND scintilla);
 
     // 请求当前视图重新绘制。
     void refresh() const;

@@ -103,14 +103,18 @@ bool InlineIconLayer::addIcon(Sci_Position line, Sci_Position slotPosition,
     return true;
 }
 
-void InlineIconLayer::paint(HWND scintilla) const {
+void InlineIconLayer::paint(HWND scintilla) {
     const auto viewIt = anchorsByView_.find(scintilla);
     if (viewIt == anchorsByView_.end() || viewIt->second.empty()) return;
 
     RECT client{};
     if (!::GetClientRect(scintilla, &client)) return;
 
-    ScintillaGateway view(scintilla);
+    // 复用成员 gateway_：避免每次绘制（高频，SCN_PAINTED 触发）重新通过
+    // SendMessage 获取 SCI_GETDIRECTFUNCTION/POINTER。paint 仅读取坐标信息，
+    // 不改写文本/style，切到 scintilla 视图不影响 Coordinator 的当前 attach 目标。
+    ScintillaGateway& view = gateway_;
+    view.attach(scintilla);
     const Sci_Position firstDisplay = (std::max)(0, view.getFirstVisibleLine());
     const int visibleLines = (std::max)(1, view.linesOnScreen());
     Sci_Position firstLine = view.docLineFromVisible(firstDisplay);

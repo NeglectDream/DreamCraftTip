@@ -131,9 +131,13 @@ void DecorationCoordinator::onFileChanged() {
 }
 
 void DecorationCoordinator::onStylesChanged() {
-    if (!ready_ || !gateway_ || !colorIndicator_ || !inlineIcons_) return;
+    if (!ready_ || !gateway_ || !colorIndicator_ || !inlineIcons_ || !debouncer_) return;
 
+    // 主题/样式变更：两视图的 indicator/slot 定义都必须重建，且两视图都要重扫。
+    // 原实现把排队委托给 onFileChanged()，但后者只排队 currentScintilla，
+    // 导致副视图虽被 init() 却不会进入 pendingViews_，scan() 遗漏它，旧装饰残留。
     initializedViews_.clear();
+    pendingViews_.clear();
     const HWND views[] = {
         nppData_._scintillaMainHandle,
         nppData_._scintillaSecondHandle,
@@ -145,8 +149,9 @@ void DecorationCoordinator::onStylesChanged() {
         colorIndicator_->init();
         inlineIcons_->init();
         initializedViews_.insert(view);
+        pendingViews_.insert(view);
     }
-    onFileChanged();
+    debouncer_->triggerAfter(MC_FILE_EVENT_DEBOUNCE_MS);
 }
 
 void DecorationCoordinator::onModifiedDebounced(
@@ -175,10 +180,8 @@ void DecorationCoordinator::onModifiedDebounced(
     // 防止防抖期间在旧窗口边界外遗留宽槽 style 或颜色 indicator。
     if (length > 0) {
         for (const HWND view : pendingViews_) {
-            const auto viewRanges = decoratedRanges_.find(view);
-            if (viewRanges == decoratedRanges_.end()) continue;
-            const auto range = viewRanges->second.find(document);
-            if (range == viewRanges->second.end()) continue;
+            const auto range = decoratedRanges_.find({view, document});
+            if (range == decoratedRanges_.end()) continue;
 
             DecoratedRange& decorated = range->second;
             if (modificationType & SC_MOD_INSERTTEXT) {
@@ -219,6 +222,10 @@ void DecorationCoordinator::onViewportChanged(HWND scintilla) {
 
 void DecorationCoordinator::onPainted(HWND scintilla) {
     if (!ready_ || !inlineIcons_ || !scintilla) return;
+    // InlineIconLayer::paint 复用 Coordinator 注入的 gateway_，而 gateway_ 的
+    // 当前 attach 目标由 Coordinator 控制（扫描/通知路径上已切到对应视图）。
+    // 但 SCN_PAINTED 可能在 Coordinator 未重定向 gateway_ 的视图上触发；
+    // 防御性地在 paint 内自行 attach 到目标 scintilla，避免读到错误视图的坐标。
     inlineIcons_->paint(scintilla);
 }
 
@@ -292,26 +299,22 @@ void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
 
     const Sci_Position docLen = gateway_->getLength();
     const sptr_t document = gateway_->getDocumentPointer();
-    auto& documentRanges = decoratedRanges_[scintilla];
     // 每个 buffer 保留独立旧范围；切走后再返回时仍能清除上次可见窗口的装饰。
-    auto previousRange = documentRanges.find(document);
+    // 扁平化键替代原二级 map，避免 operator[] 在早退路径上留下空内层条目。
+    auto previousIt = decoratedRanges_.find({scintilla, document});
     inlineIcons_->clearAnchors();
     if (!yamlFile) {
         // 只恢复本插件确实装饰过的范围；首次看到普通文件时绝不改写其 style。
-        if (previousRange != documentRanges.end()) {
-            const Sci_Position clearStart =
-                (std::max)(static_cast<Sci_Position>(0), previousRange->second.start);
-            const Sci_Position clearEnd = (std::min)(docLen, previousRange->second.end);
-            inlineIcons_->clearRange(clearStart, clearEnd);
-            colorIndicator_->clearRange(clearStart, clearEnd, false);
-            documentRanges.erase(previousRange);
+        if (previousIt != decoratedRanges_.end()) {
+            clearDecorationRange(previousIt->second.start, previousIt->second.end, docLen, false);
+            decoratedRanges_.erase(previousIt);
         }
         inlineIcons_->refresh();
         return;
     }
     if (docLen <= 0) {
-        if (previousRange != documentRanges.end())
-            documentRanges.erase(previousRange);
+        if (previousIt != decoratedRanges_.end())
+            decoratedRanges_.erase(previousIt);
         inlineIcons_->refresh();
         return;
     }
@@ -366,20 +369,27 @@ void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
         : docLen;
 
     // 先清理该视图/文档离开窗口的旧范围，避免残留扩宽槽位和颜色 indicator。
-    if (previousRange != documentRanges.end() &&
-        (previousRange->second.start != scanStart || previousRange->second.end != scanEnd)) {
-        const Sci_Position oldStart =
-            (std::max)(static_cast<Sci_Position>(0), previousRange->second.start);
-        const Sci_Position oldEnd = (std::min)(docLen, previousRange->second.end);
-        inlineIcons_->clearRange(oldStart, oldEnd);
-        colorIndicator_->clearRange(oldStart, oldEnd, false);
+    // 旧 [old.start, old.end) 与新 [scanStart, scanEnd) 的差集最多两段：左差与右差。
+    // 重叠部分随后由新范围整体清除，这里只清理"不再覆盖"的边缘，避免重复 SendMessage。
+    if (previousIt != decoratedRanges_.end() &&
+        (previousIt->second.start != scanStart || previousIt->second.end != scanEnd)) {
+        const Sci_Position oldStart = previousIt->second.start;
+        const Sci_Position oldEnd = previousIt->second.end;
+        const Sci_Position leftEnd = (std::min)(oldEnd, scanStart);
+        const Sci_Position rightStart = (std::max)(oldStart, scanEnd);
+        clearDecorationRange(oldStart, leftEnd, docLen, false);
+        clearDecorationRange(rightStart, oldEnd, docLen, false);
     }
-    inlineIcons_->clearRange(scanStart, scanEnd);
-    colorIndicator_->clearRange(scanStart, scanEnd, true);
-    documentRanges[document] = {scanStart, scanEnd};
+    clearDecorationRange(scanStart, scanEnd, docLen, true);
+    decoratedRanges_[{scintilla, document}] = {scanStart, scanEnd};
 
     // 整个扫描窗口只跨一次 Scintilla 边界，后续拆行和 value 提取均在内存完成。
     const std::string scanText = gateway_->getTextRange(scanStart, scanEnd);
+    // 扫描窗口内的 style 一次取回：原循环每行发一次 SCI_GETSTYLEINDEXAT，
+    // 大文件可视区约 50-200 行 → 50-200 次 SendMessage；改为单次 SCI_GETSTYLEDTEXTFULL
+    // 后 style 读取降为 O(1) 数组索引，与 ColorIndicator 已有优化同构。
+    const std::vector<unsigned char> styleIndices =
+        gateway_->getStyleIndices(scanStart, scanEnd);
     int blockParentIndent = -1;
     int blockContentIndent = -1;
     size_t lineOffset = 0;
@@ -411,7 +421,12 @@ void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
         // YAML lexer 已知该行是块标量正文时直接使用；即使扫描窗口从超长
         // 块正文中部开始，也无需依赖 padding 内能找到原始 |/> 块头。
         const Sci_Position firstContent = lineStart + static_cast<Sci_Position>(indent);
-        if (!blankLine && gateway_->getStyleIndexAt(firstContent) == STYLE_YAML_BLOCK_TEXT) {
+        const size_t firstContentOffset = static_cast<size_t>(firstContent - scanStart);
+        const bool blockTextStyled =
+            !blankLine
+            && firstContentOffset < styleIndices.size()
+            && styleIndices[firstContentOffset] == STYLE_YAML_BLOCK_TEXT;
+        if (blockTextStyled) {
             valueRange.start = firstContent;
             valueRange.end = lineEnd;
             valueRange.scalarStart = valueRange.start;
@@ -482,4 +497,16 @@ void DecorationCoordinator::scanView(HWND scintilla, bool yamlFile) {
     // 重着色，所有 slot style（含末行）原样保留。
     gateway_->startStyling(docLen);
     inlineIcons_->refresh();
+}
+
+void DecorationCoordinator::clearDecorationRange(
+    Sci_Position start, Sci_Position end, Sci_Position docLen, bool recolourise) {
+    // 统一 clamp 到 [0, docLen]；空区间直接返回，与 InlineIconLayer/ColorIndicator
+    // 内部对 (end <= start) 的容忍保持一致。recolourise 仅在即将重扫时启用，
+    // 让 ColorIndicator 借机触发 SCI_COLOURISE / StardDGuard 收尾。
+    const Sci_Position clampedStart = (std::max)(static_cast<Sci_Position>(0), start);
+    const Sci_Position clampedEnd = (std::min)(docLen, end);
+    if (clampedEnd <= clampedStart) return;
+    inlineIcons_->clearRange(clampedStart, clampedEnd);
+    colorIndicator_->clearRange(clampedStart, clampedEnd, recolourise);
 }
